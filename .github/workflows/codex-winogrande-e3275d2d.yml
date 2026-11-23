@@ -1,4 +1,4 @@
-name: Winogrande accuracy validation
+name: Winogrande exact-source CI diagnosis
 on:
   push:
     branches: [codex-winogrande-ci-e3275d2d]
@@ -9,7 +9,7 @@ permissions:
 jobs:
   compare:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 12
     env:
       DEEPEVAL_TELEMETRY_OPT_OUT: '1'
       DEEPEVAL_DISABLE_DOTENV: '1'
@@ -57,38 +57,33 @@ jobs:
           poetry install --no-interaction --only main
           poetry install --no-interaction --with dev
           git diff HEAD --exit-code
-      - name: Verify old behavior fails the two witnesses
+      - name: Compare SQLite warning wrapping
         shell: bash
         run: |
           interpreter="$(poetry env info --executable)"
+          node="tests/test_core/test_sqlite_store.py::TestTestRunManagerIntegration::test_storage_failure_is_a_warning_not_an_error"
           base_source="$RUNNER_TEMP/base-source"
-          cd "$base_source"
-          PYTHONPATH="$base_source" "$interpreter" -c 'import deepeval, pathlib; assert pathlib.Path(deepeval.__file__).resolve().is_relative_to(pathlib.Path.cwd())'
-          set +e
-          PYTHONPATH="$base_source" "$interpreter" -m pytest -q -p no:cacheprovider \
-            --junitxml="$RUNNER_TEMP/base.xml" "$RUNNER_TEMP/test_winogrande_accuracy_denominator.py"
-          code=$?
-          set -e
-          test "$code" = 1
-          "$interpreter" - "$RUNNER_TEMP/base.xml" <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          cases = ET.parse(sys.argv[1]).findall(".//testcase")
-          assert len(cases) == 6, len(cases)
-          assert not any(case.find("error") is not None or case.find("skipped") is not None for case in cases)
-          failures = [case.find("failure").get("message") for case in cases if case.find("failure") is not None]
-          assert len(failures) == 2, failures
-          assert any("assert 0.5 == 1.0" in item for item in failures), failures
-          assert any("assert 0.3333333333333333 == 0.5" in item for item in failures), failures
-          print("Verified base: two expected accuracy failures, four controls passed")
-          PY
-      - name: Run candidate benchmark suite
-        shell: bash
-        run: |
-          poetry run python -c 'import deepeval, pathlib; assert pathlib.Path(deepeval.__file__).resolve().is_relative_to(pathlib.Path.cwd())'
-          poetry run python -m pytest -q -p no:cacheprovider tests/test_benchmarks/
-          poetry run black --check deepeval/benchmarks/winogrande/winogrande.py "$REGRESSION"
+          candidate_source="$PWD"
+          for variant in base candidate; do
+            root="$candidate_source"
+            if test "$variant" = base; then
+              root="$base_source"
+            fi
+            (
+              cd "$root"
+              PYTHONPATH="$root" "$interpreter" -c 'import deepeval, pathlib; assert pathlib.Path(deepeval.__file__).resolve().is_relative_to(pathlib.Path.cwd())'
+              set +e
+              COLUMNS=80 PYTHONPATH="$root" "$interpreter" -m pytest -q -p no:cacheprovider "$node" > "$RUNNER_TEMP/$variant-narrow.log" 2>&1
+              outcome=$?
+              set -e
+              cat "$RUNNER_TEMP/$variant-narrow.log"
+              printf 'variant=%s width=80 pytest_exit=%s\n' "$variant" "$outcome"
+              test "$outcome" = 1
+              EXPECTED_WRAP='disk\nI/O error' grep -F 'disk\nI/O error' "$RUNNER_TEMP/$variant-narrow.log"
+              COLUMNS=120 PYTHONPATH="$root" "$interpreter" -m pytest -q -p no:cacheprovider "$node"
+              printf 'variant=%s width=120 pytest_exit=0\n' "$variant"
+            )
+          done
       - name: Recheck tracked source and exact identities
         if: always()
         shell: bash
